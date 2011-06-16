@@ -557,7 +557,8 @@ static void              _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger 
 static NSUInteger        _JKDictionaryCapacityForCount(NSUInteger count);
 static JKDictionary     *_JKDictionaryCreate(id *keys, NSUInteger *keyHashes, id *objects, NSUInteger count, BOOL mutableCollection);
 static JKHashTableEntry *_JKDictionaryHashEntry(JKDictionary *dictionary);
-static NSUInteger        _JKDictionaryCapacity(JKDictionary *dictionary);
+static NSUInteger       *_JKDictionaryOrderArray(JKDictionary *dictionary);
+static NSUInteger        _JKDictionaryCount(JKDictionary *dictionary);
 static void              _JKDictionaryResizeIfNeccessary(JKDictionary *dictionary);
 static void              _JKDictionaryRemoveObjectWithEntry(JKDictionary *dictionary, JKHashTableEntry *entry);
 static void              _JKDictionaryAddObject(JKDictionary *dictionary, NSUInteger keyHash, id key, id object);
@@ -859,13 +860,15 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
 - (id)nextObject
 {
   NSParameterAssert((collection != NULL) && (_JKDictionaryHashEntry(collection) != NULL));
-  JKHashTableEntry *entry        = _JKDictionaryHashEntry(collection);
-  NSUInteger        capacity     = _JKDictionaryCapacity(collection);
-  id                returnObject = NULL;
+  JKHashTableEntry *entry      = _JKDictionaryHashEntry(collection);
+  NSUInteger       *orderArray = _JKDictionaryOrderArray(collection);
+  NSUInteger        count      = _JKDictionaryCount(collection);
 
-  if(entry != NULL) { while((nextObject < capacity) && ((returnObject = entry[nextObject++].key) == NULL)) { /* ... */ } }
-  
-  return(returnObject);
+  if( entry != NULL && nextObject < count ) {
+    return entry[ orderArray[nextObject] ].key;
+  } else {
+    return nil;
+  }
 }
 
 @end
@@ -873,6 +876,7 @@ static void _JKArrayRemoveObjectAtIndex(JKArray *array, NSUInteger objectIndex) 
 #pragma mark -
 @interface JKDictionary : NSMutableDictionary <NSCopying, NSMutableCopying, NSFastEnumeration> {
   NSUInteger count, capacity, mutations;
+  NSUInteger *orderArray;
   JKHashTableEntry *entry;
 }
 @end
@@ -911,14 +915,21 @@ static void _JKDictionaryResizeIfNeccessary(JKDictionary *dictionary) {
     NSUInteger oldCount = dictionary->count;
 #endif
     JKHashTableEntry *oldEntry    = dictionary->entry;
+    NSUInteger *oldOrderArray = dictionary->orderArray;
     if(JK_EXPECT_F((dictionary->entry = (JKHashTableEntry *)calloc(1UL, sizeof(JKHashTableEntry) * capacityForCount)) == NULL)) { [NSException raise:NSMallocException format:@"Unable to allocate memory for hash table."]; }
+    if(JK_EXPECT_F((dictionary->orderArray = (NSUInteger *)calloc(1UL, sizeof(NSUInteger) * capacityForCount)) == NULL)) { [NSException raise:NSMallocException format:@"Unable to allocate memory for order array."]; }
     dictionary->capacity = capacityForCount;
     dictionary->count    = 0UL;
     
-    NSUInteger idx = 0UL;
-    for(idx = 0UL; idx < oldCapacity; idx++) { if(oldEntry[idx].key != NULL) { _JKDictionaryAddObject(dictionary, oldEntry[idx].keyHash, oldEntry[idx].key, oldEntry[idx].object); oldEntry[idx].keyHash = 0UL; oldEntry[idx].key = NULL; oldEntry[idx].object = NULL; } }
+    for(NSUInteger i = 0UL; i < oldCapacity; i++) {
+      NSUInteger idx = oldOrderArray[i];
+      NSCParameterAssert((oldEntry[idx].key != NULL));
+      _JKDictionaryAddObject(dictionary, oldEntry[idx].keyHash, oldEntry[idx].key, oldEntry[idx].object);
+      oldEntry[idx].keyHash = 0UL; oldEntry[idx].key = NULL; oldEntry[idx].object = NULL;
+    }
     NSCParameterAssert((oldCount == dictionary->count));
     free(oldEntry); oldEntry = NULL;
+    free(oldOrderArray); oldOrderArray = NULL;
   }
 }
 
@@ -932,6 +943,7 @@ static JKDictionary *_JKDictionaryCreate(id *keys, NSUInteger *keyHashes, id *ob
     dictionary->count    = 0UL;
     
     if(JK_EXPECT_F((dictionary->entry = (JKHashTableEntry *)calloc(1UL, sizeof(JKHashTableEntry) * dictionary->capacity)) == NULL)) { [dictionary autorelease]; return(NULL); }
+    if(JK_EXPECT_F((dictionary->orderArray = (NSUInteger *)calloc(1UL, sizeof(NSUInteger) * dictionary->capacity)) == NULL)) { [dictionary autorelease]; return(NULL); }
 
     NSUInteger idx = 0UL;
     for(idx = 0UL; idx < count; idx++) { _JKDictionaryAddObject(dictionary, keyHashes[idx], keys[idx], objects[idx]); }
@@ -951,6 +963,7 @@ static JKDictionary *_JKDictionaryCreate(id *keys, NSUInteger *keyHashes, id *ob
     }
   
     free(entry); entry = NULL;
+    free(orderArray); orderArray = NULL;
   }
 
   [super dealloc];
@@ -961,9 +974,14 @@ static JKHashTableEntry *_JKDictionaryHashEntry(JKDictionary *dictionary) {
   return(dictionary->entry);
 }
 
-static NSUInteger _JKDictionaryCapacity(JKDictionary *dictionary) {
+static NSUInteger *_JKDictionaryOrderArray(JKDictionary *dictionary) {
   NSCParameterAssert(dictionary != NULL);
-  return(dictionary->capacity);
+  return(dictionary->orderArray);
+}
+
+static NSUInteger _JKDictionaryCount(JKDictionary *dictionary) {
+  NSCParameterAssert(dictionary != NULL);
+  return(dictionary->count);
 }
 
 static void _JKDictionaryRemoveObjectWithEntry(JKDictionary *dictionary, JKHashTableEntry *entry) {
@@ -971,9 +989,24 @@ static void _JKDictionaryRemoveObjectWithEntry(JKDictionary *dictionary, JKHashT
   CFRelease(entry->key);    entry->key    = NULL;
   CFRelease(entry->object); entry->object = NULL;
   entry->keyHash = 0UL;
-  dictionary->count--;
-  // In order for certain invariants that are used to speed up the search for a particular key, we need to "re-add" all the entries in the hash table following this entry until we hit a NULL entry.
+  
   NSUInteger removeIdx = entry - dictionary->entry, idx = 0UL;
+
+  // remove the element from the order array
+  NSUInteger i = 0;
+  for( i = 0; i < dictionary->count; ++i ) {
+    if ( dictionary->orderArray[i] == removeIdx ) {
+      break;
+    }
+  }
+  while ( i < dictionary->count - 1 ) {
+    dictionary->orderArray[i] = dictionary->orderArray[i+1];
+    ++i;
+  }
+
+  dictionary->count--;
+    
+  // In order for certain invariants that are used to speed up the search for a particular key, we need to "re-add" all the entries in the hash table following this entry until we hit a NULL entry.
   NSCParameterAssert((removeIdx < dictionary->capacity));
   for(idx = 0UL; idx < dictionary->capacity; idx++) {
     NSUInteger entryIdx = (removeIdx + idx + 1UL) % dictionary->capacity;
@@ -987,8 +1020,22 @@ static void _JKDictionaryRemoveObjectWithEntry(JKDictionary *dictionary, JKHashT
     atEntry->object  = NULL;
     NSUInteger addKeyEntry = keyHash % dictionary->capacity, addIdx = 0UL;
     for(addIdx = 0UL; addIdx < dictionary->capacity; addIdx++) {
-      JKHashTableEntry *atAddEntry = &dictionary->entry[((addKeyEntry + addIdx) % dictionary->capacity)];
-      if(JK_EXPECT_T(atAddEntry->key == NULL)) { NSCParameterAssert((atAddEntry->keyHash == 0UL) && (atAddEntry->object == NULL)); atAddEntry->key = key; atAddEntry->object = object; atAddEntry->keyHash = keyHash; break; }
+      NSUInteger newEntryIdx = ((addKeyEntry + addIdx) % dictionary->capacity);
+      JKHashTableEntry *atAddEntry = &dictionary->entry[newEntryIdx];
+      if(JK_EXPECT_T(atAddEntry->key == NULL)) {
+        NSCParameterAssert((atAddEntry->keyHash == 0UL) && (atAddEntry->object == NULL));
+        atAddEntry->key = key;
+        atAddEntry->object = object;
+        atAddEntry->keyHash = keyHash;
+        // inform the order array of the changed position
+        for( NSUInteger i = 0; i < dictionary->count; ++i ) {
+          if ( dictionary->orderArray[i] == entryIdx ) {
+            dictionary->orderArray[i] = newEntryIdx;
+            break;
+          }
+        }
+        break;
+      }
     }
   }
 }
@@ -999,8 +1046,8 @@ static void _JKDictionaryAddObject(JKDictionary *dictionary, NSUInteger keyHash,
   for(idx = 0UL; idx < dictionary->capacity; idx++) {
     NSUInteger entryIdx = (keyEntry + idx) % dictionary->capacity;
     JKHashTableEntry *atEntry = &dictionary->entry[entryIdx];
-    if(JK_EXPECT_F(atEntry->keyHash == keyHash) && JK_EXPECT_T(atEntry->key != NULL) && (JK_EXPECT_F(key == atEntry->key) || JK_EXPECT_F(CFEqual(atEntry->key, key)))) { _JKDictionaryRemoveObjectWithEntry(dictionary, atEntry); }
-    if(JK_EXPECT_T(atEntry->key == NULL)) { NSCParameterAssert((atEntry->keyHash == 0UL) && (atEntry->object == NULL)); atEntry->key = key; atEntry->object = object; atEntry->keyHash = keyHash; dictionary->count++; return; }
+    if(JK_EXPECT_F(atEntry->keyHash == keyHash) && JK_EXPECT_T(atEntry->key != NULL) && (JK_EXPECT_F(key == atEntry->key) || JK_EXPECT_F(CFEqual(atEntry->key, key)))) { CFRelease(atEntry->object); atEntry->object = object; return; }
+    if(JK_EXPECT_T(atEntry->key == NULL)) { NSCParameterAssert((atEntry->keyHash == 0UL) && (atEntry->object == NULL)); atEntry->key = key; atEntry->object = object; atEntry->keyHash = keyHash; dictionary->orderArray[dictionary->count]=entryIdx; dictionary->count++; return; }
   }
 
   // We should never get here.  If we do, we -release the key / object because it's our responsibility.
@@ -1036,14 +1083,13 @@ static JKHashTableEntry *_JKDictionaryHashTableEntryForKey(JKDictionary *diction
 - (void)getObjects:(id *)objects andKeys:(id *)keys
 {
   NSParameterAssert((entry != NULL) && (count <= capacity));
-  NSUInteger atEntry = 0UL; NSUInteger arrayIdx = 0UL;
-  for(atEntry = 0UL; atEntry < capacity; atEntry++) {
-    if(JK_EXPECT_T(entry[atEntry].key != NULL)) {
-      NSCParameterAssert((entry[atEntry].object != NULL) && (arrayIdx < count));
-      if(JK_EXPECT_T(keys    != NULL)) { keys[arrayIdx]    = entry[atEntry].key;    }
-      if(JK_EXPECT_T(objects != NULL)) { objects[arrayIdx] = entry[atEntry].object; }
-      arrayIdx++;
-    }
+  NSUInteger arrayIdx = 0UL;
+  for(arrayIdx = 0UL; arrayIdx < count; arrayIdx++) {
+    NSUInteger atEntry = orderArray[arrayIdx];
+    NSParameterAssert((entry[atEntry].key != NULL));
+    NSCParameterAssert((entry[atEntry].object != NULL) && (arrayIdx < count));
+    if(JK_EXPECT_T(keys    != NULL)) { keys[arrayIdx]    = entry[atEntry].key;    }
+    if(JK_EXPECT_T(objects != NULL)) { objects[arrayIdx] = entry[atEntry].object; }
   }
 }
 
@@ -1054,7 +1100,12 @@ static JKHashTableEntry *_JKDictionaryHashTableEntryForKey(JKDictionary *diction
   if(JK_EXPECT_F(state->state >= capacity)) { return(0UL); }
   
   NSUInteger enumeratedCount  = 0UL;
-  while(JK_EXPECT_T(enumeratedCount < len) && JK_EXPECT_T(state->state < capacity)) { if(JK_EXPECT_T(entry[state->state].key != NULL)) { stackbuf[enumeratedCount++] = entry[state->state].key; } state->state++; }
+  while(JK_EXPECT_T(enumeratedCount < len) && JK_EXPECT_T(state->state < count)) {
+    NSUInteger idx = orderArray[state->state];
+    NSParameterAssert((entry[idx].key != NULL));
+    stackbuf[enumeratedCount++] = entry[idx].key;
+    state->state++;
+  }
     
   return(enumeratedCount);
 }
